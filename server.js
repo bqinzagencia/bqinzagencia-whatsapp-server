@@ -18,7 +18,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 // ── Firebase Admin ────────────────────────────────────────────────────────
-const serviceAccount = require('./firebase-key.json');
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  // Railway/Vercel: leer desde variable de entorno
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } catch (e) {
+    console.error('Error parseando FIREBASE_SERVICE_ACCOUNT:', e.message);
+    process.exit(1);
+  }
+} else {
+  // Local: leer desde archivo
+  serviceAccount = require('./firebase-key.json');
+}
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
