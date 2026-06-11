@@ -292,8 +292,8 @@ app.post('/sesion/iniciar', auth, async (req, res) => {
     const result = await iniciarSesion(empresaId);
     res.json({ ok: true, ...result });
   } catch (err) {
-    console.error('Error iniciando sesion:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Error iniciando sesion:', err.message, err.stack);
+    res.status(500).json({ error: err.message, stack: err.stack?.split('\n')[0] });
   }
 });
 
