@@ -291,7 +291,7 @@ app.get('/sesion/:empresaId/qr', auth, async (req, res) => {
   const sesion = sesiones.get(empresaId);
 
   if (!sesion) {
-    return res.status(404).json({ error: 'Sesion no encontrada. Inicia la sesion primero.' });
+    return res.json({ status: 'not_started' });
   }
 
   if (sesion.status === 'connected') {
@@ -302,19 +302,8 @@ app.get('/sesion/:empresaId/qr', auth, async (req, res) => {
     return res.json({ status: 'qr_ready', qrBase64: sesion.qrBase64 });
   }
 
-  // Esperar hasta 15s a que aparezca el QR
-  let intentos = 0;
-  const esperar = () => new Promise(resolve => setTimeout(resolve, 1000));
-
-  while (intentos < 15) {
-    await esperar();
-    const s = sesiones.get(empresaId);
-    if (s?.qrBase64)          return res.json({ status: 'qr_ready', qrBase64: s.qrBase64 });
-    if (s?.status === 'connected') return res.json({ status: 'connected', numero: s.numero });
-    intentos++;
-  }
-
-  res.status(408).json({ error: 'Tiempo de espera agotado. Reintenta.' });
+  // Todavia generando QR — responder inmediatamente sin esperar
+  return res.json({ status: sesion.status || 'connecting' });
 });
 
 // GET /sesion/:empresaId/status — estado de la sesion
