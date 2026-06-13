@@ -182,7 +182,15 @@ INSTRUCCIONES:
     return res.json({ respuesta });
 
   } catch (err) {
-    console.error('Error whatsapp-baileys:', err);
-    return res.status(500).json({ error: err.message });
+    // ── Log mejorado para errores de OpenAI ──
+    const status  = err.status ?? err.response?.status ?? 'N/A';
+    const errData = err.error  ?? err.response?.data   ?? null;
+    console.error('[❌ whatsapp-baileys] Error (status', status + '):', err.message);
+    if (errData) console.error('[❌ whatsapp-baileys] OpenAI error data:', JSON.stringify(errData, null, 2));
+    return res.status(500).json({
+      error: err.message,
+      openai_status: status,
+      openai_data: errData,
+    });
   }
 }
