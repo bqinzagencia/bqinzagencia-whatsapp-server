@@ -74,8 +74,12 @@ async function iniciarSesion(empresaId, opts = {}) {
   }
   // Si hay una sesion previa sin conectar (ej. QR) y ahora se pide pairing (o viceversa), reiniciamos el socket
   if (existente && existente.sock) {
+    try { existente.sock.ev?.removeAllListeners?.(); } catch {}
     try { existente.sock.end?.(new Error('reinicio de sesion')); } catch {}
     sesiones.delete(empresaId);
+    // Dar tiempo a que el socket viejo cierre archivos/conexion antes de abrir uno nuevo
+    // sobre la misma carpeta de credenciales (evita 'Connection Closed' por condicion de carrera)
+    await new Promise(r => setTimeout(r, 800));
   }
 
   const {
@@ -179,6 +183,10 @@ async function iniciarSesion(empresaId, opts = {}) {
     }
 
     if (connection === 'close') {
+      // Si esta sesion ya fue reemplazada (ej. el usuario cambio de QR a pairing),
+      // ignorar por completo — no reconectar una sesion fantasma.
+      if (sesiones.get(empresaId) !== sesionData) return;
+
       const code    = lastDisconnect?.error?.output?.statusCode;
       const logout  = code === DisconnectReason.loggedOut;
       sesionData.status = logout ? 'disconnected' : 'reconnecting';
@@ -193,9 +201,13 @@ async function iniciarSesion(empresaId, opts = {}) {
         }).catch(() => {});
         console.log(`[${empresaId}] Sesion cerrada (logout)`);
       } else {
-        // Reconectar automaticamente
+        // Reconectar automaticamente (solo si esta sesion sigue siendo la vigente)
         console.log(`[${empresaId}] Desconectado, reconectando...`);
-        setTimeout(() => iniciarSesion(empresaId), 5000);
+        setTimeout(() => {
+          if (sesiones.get(empresaId) === sesionData || !sesiones.has(empresaId)) {
+            iniciarSesion(empresaId, numero ? { numero } : {});
+          }
+        }, 5000);
       }
     }
   });
