@@ -1,5 +1,6 @@
 // server.js — agencIAme WhatsApp Multi-Empresa Server
-// Cada empresa tiene su propia sesion Baileys identificada por empresaId
+// v4: + recordatorios de citas (Plan Pro) + seguimiento post-servicio (Estandar/Pro)
+//     con limites de seguridad: horario, delays aleatorios y tope diario por empresa
 
 import express from 'express';
 import cors from 'cors';
@@ -15,73 +16,77 @@ import path from 'path';
 import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
+const require   = createRequire(import.meta.url);
 
-// ── Firebase Admin ────────────────────────────────────────────────────────
-let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  // Railway/Vercel: leer desde variable de entorno
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  } catch (e) {
-    console.error('Error parseando FIREBASE_SERVICE_ACCOUNT:', e.message);
-    process.exit(1);
-  }
-} else {
-  // Local: leer desde archivo
-  serviceAccount = require('./firebase-key.json');
-}
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
-// ── Config ────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3001;
-const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secret';
-const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://bqinzagencia.com';
+const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secreto_nexoia';
+const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://agenciame.com';
 
-// ── Sesiones en memoria ───────────────────────────────────────────────────
-// Map: empresaId -> { sock, status, qr, qrBase64, mensajesPendientes }
 const sesiones = new Map();
-const msgCache = new NodeCache({ stdTTL: 300 }); // 5 minutos — evita duplicados tras reinicios
-const logger   = pino({ level: 'warn' }); // silencioso en produccion
+const msgCache = new NodeCache({ stdTTL: 300 });
+const logger   = pino({ level: 'warn' });
 
-// ── Express ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Middleware de autenticacion
-const auth = (req, res, next) => {
+const authMiddleware = (req, res, next) => {
   const token = req.headers['x-server-secret'] || req.query.secret;
   if (token !== SERVER_SECRET) return res.status(401).json({ error: 'No autorizado' });
   next();
 };
 
-// ── Baileys dinamico (importado en runtime) ───────────────────────────────
 async function getBaileys() {
-  const mod = await import('@whiskeysockets/baileys');
-  return mod;
+  return import('@whiskeysockets/baileys');
 }
 
-// ── Crear/reconectar sesion para una empresa ──────────────────────────────
-async function iniciarSesion(empresaId, opts = {}) {
-  const { numero } = opts;
+async function saveCredsToFirestore(empresaId, creds) {
+  try {
+    await db.collection('wa_sessions').doc(empresaId).set(
+      { creds: JSON.stringify(creds), updatedAt: FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  } catch (e) { console.error(`[${empresaId}] saveCredsToFirestore:`, e.message); }
+}
 
-  // Si ya hay sesion activa, no hacer nada
-  const existente = sesiones.get(empresaId);
-  if (existente && existente.status === 'connected') {
-    return { status: 'already_connected' };
-  }
-  // Si hay una sesion previa sin conectar (ej. QR) y ahora se pide pairing (o viceversa), reiniciamos el socket
-  if (existente && existente.sock) {
-    try { existente.sock.ev?.removeAllListeners?.(); } catch {}
-    try { existente.sock.end?.(new Error('reinicio de sesion')); } catch {}
-    sesiones.delete(empresaId);
-    // Dar tiempo a que el socket viejo cierre archivos/conexion antes de abrir uno nuevo
-    // sobre la misma carpeta de credenciales (evita 'Connection Closed' por condicion de carrera)
-    await new Promise(r => setTimeout(r, 800));
-  }
+async function loadCredsFromFirestore(empresaId) {
+  try {
+    const snap = await db.collection('wa_sessions').doc(empresaId).get();
+    if (!snap.exists) return null;
+    const raw = snap.data().creds;
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
 
+async function deleteSessionFromFirestore(empresaId) {
+  try { await db.collection('wa_sessions').doc(empresaId).delete(); } catch {}
+}
+
+// ── Enviar imagen por WhatsApp desde URL ──────────────────────
+async function enviarImagen(sock, jid, url, caption = '') {
+  try {
+    // Descargar imagen como buffer
+    const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+    const buffer = Buffer.from(resp.data);
+    const mimetype = resp.headers['content-type'] || 'image/jpeg';
+
+    await sock.sendMessage(jid, {
+      image: buffer,
+      mimetype,
+      caption: caption || undefined,
+    });
+    return true;
+  } catch (e) {
+    console.error(`Error enviando imagen ${url}:`, e.message);
+    return false;
+  }
+}
+
+async function crearSocket(empresaId, usePairingCode = false) {
   const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -90,192 +95,106 @@ async function iniciarSesion(empresaId, opts = {}) {
     fetchLatestBaileysVersion,
   } = await getBaileys();
 
-  // Carpeta de sesion persistente por empresa
-  const sessionDir = path.join(__dirname, 'sessions', empresaId);
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-
-  // Si se pide codigo de vinculacion y esta empresa no tiene una sesion ya
-  // vinculada, empezamos con credenciales 100% limpias. Reusar el noise-key
-  // que quedo de un intento de QR anterior sobre la misma carpeta hace que
-  // WhatsApp cierre la conexion ("Connection Closed") al pedir el pairing code.
-  if (numero && !state.creds.registered) {
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-    fs.mkdirSync(sessionDir, { recursive: true });
-    ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
+  const savedCreds = await loadCredsFromFirestore(empresaId);
+  if (savedCreds) {
+    try {
+      fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedCreds));
+      console.log(`[${empresaId}] Creds restauradas desde Firestore`);
+    } catch {}
   }
 
-  const { version } = await fetchLatestBaileysVersion();
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version }          = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
+    version, logger,
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
+    printQRInTerminal: !usePairingCode,
+    ...(usePairingCode ? { browser: ['agencIAme', 'Chrome', '120.0.0'] } : {}),
   });
 
-  const sesionData = {
-    sock,
-    status: 'connecting',
-    qr: null,
-    qrBase64: null,
-    empresaId,
-    numero: null,
-    pairingCode: null,
-    metodo: numero ? 'pairing' : 'qr',
-  };
+  const sesionData = { sock, status: 'connecting', qr: null, qrBase64: null, empresaId, numero: null, connectedAt: null, usePairingCode };
   sesiones.set(empresaId, sesionData);
 
-  // ── Si se pidio codigo de vinculacion (pairing), solicitarlo ya mismo ────
-  if (numero && !state.creds.registered) {
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
     try {
-      const numeroLimpio = String(numero).replace(/[^\d]/g, '');
-      const code = await sock.requestPairingCode(numeroLimpio);
-      sesionData.pairingCode = code;
-      sesionData.status = 'pairing_ready';
-
-      await db.collection('empresas').doc(empresaId).update({
-        'whatsapp.status': 'pairing_ready',
-        'whatsapp.pairingCode': code,
-        'whatsapp.updatedAt': FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      console.log(`[${empresaId}] Pairing code generado: ${code}`);
-    } catch (err) {
-      console.error(`[${empresaId}] Error generando pairing code:`, err.message);
-      sesionData.status = 'error';
-    }
-  }
-
-  // ── Eventos Baileys ───────────────────────────────────────────────────
-  sock.ev.on('creds.update', saveCreds);
+      const credsFile = path.join(sessionDir, 'creds.json');
+      if (fs.existsSync(credsFile)) {
+        const credsData = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
+        await saveCredsToFirestore(empresaId, credsData);
+      }
+    } catch {}
+  });
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr && sesionData.metodo !== 'pairing') {
-      // Generar QR como imagen base64
+    if (qr && !usePairingCode) {
       const qrBase64 = await qrcode.toDataURL(qr);
-      sesionData.qr      = qr;
-      sesionData.qrBase64 = qrBase64;
-      sesionData.status  = 'qr_ready';
-
-      // Guardar QR en Firestore para que el dashboard lo muestre
-      await db.collection('empresas').doc(empresaId).update({
-        'whatsapp.status': 'qr_ready',
-        'whatsapp.qrBase64': qrBase64,
-        'whatsapp.updatedAt': FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      console.log(`[${empresaId}] QR listo para escanear`);
+      sesionData.qr = qr; sesionData.qrBase64 = qrBase64; sesionData.status = 'qr_ready';
+      await db.collection('empresas').doc(empresaId).set(
+        { whatsapp: { status: 'qr_ready', qrBase64, updatedAt: FieldValue.serverTimestamp() } },
+        { merge: true }
+      ).catch(() => {});
+      console.log(`[${empresaId}] QR listo`);
     }
 
     if (connection === 'open') {
-      sesionData.status   = 'connected';
-      sesionData.qr       = null;
-      sesionData.qrBase64 = null;
-      const numero = sock.user?.id?.split(':')[0] || '';
-      sesionData.numero   = numero;
-      // Marcar timestamp de conexion para ignorar mensajes anteriores
+      sesionData.status = 'connected';
+      sesionData.qr = null; sesionData.qrBase64 = null;
       sesionData.connectedAt = Date.now();
-
-      // Actualizar Firestore: conectado
-      await db.collection('empresas').doc(empresaId).update({
-        'whatsapp.status':    'connected',
-        'whatsapp.numero':    numero,
-        'whatsapp.qrBase64':  null,
-        'whatsapp.connectedAt': FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      console.log(`[${empresaId}] WhatsApp conectado - numero: ${numero}`);
+      const numero = sock.user?.id?.split(':')[0] || '';
+      sesionData.numero = numero;
+      await db.collection('empresas').doc(empresaId).set(
+        { whatsapp: { status: 'connected', activo: true, numero, qrBase64: null, connectedAt: FieldValue.serverTimestamp() } },
+        { merge: true }
+      ).catch(() => {});
+      console.log(`[${empresaId}] Conectado - ${numero}`);
     }
 
     if (connection === 'close') {
-      // Si esta sesion ya fue reemplazada (ej. el usuario cambio de QR a pairing),
-      // ignorar por completo — no reconectar una sesion fantasma.
-      if (sesiones.get(empresaId) !== sesionData) return;
-
-      const code    = lastDisconnect?.error?.output?.statusCode;
-      const logout  = code === DisconnectReason.loggedOut;
+      const code   = lastDisconnect?.error?.output?.statusCode;
+      const logout = code === DisconnectReason.loggedOut;
       sesionData.status = logout ? 'disconnected' : 'reconnecting';
-
       if (logout) {
-        // Limpiar sesion si se cerro sesion
-        fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        await deleteSessionFromFirestore(empresaId);
         sesiones.delete(empresaId);
-        await db.collection('empresas').doc(empresaId).update({
-          'whatsapp.status': 'disconnected',
-          'whatsapp.numero': null,
-        }).catch(() => {});
-        console.log(`[${empresaId}] Sesion cerrada (logout)`);
+        await db.collection('empresas').doc(empresaId).set(
+          { whatsapp: { status: 'disconnected', activo: false, numero: null } }, { merge: true }
+        ).catch(() => {});
+        console.log(`[${empresaId}] Logout`);
       } else {
-        // Reconectar automaticamente (solo si esta sesion sigue siendo la vigente)
-        console.log(`[${empresaId}] Desconectado, reconectando...`);
-        setTimeout(() => {
-          if (sesiones.get(empresaId) === sesionData || !sesiones.has(empresaId)) {
-            iniciarSesion(empresaId, numero ? { numero } : {});
-          }
-        }, 5000);
+        console.log(`[${empresaId}] Desconectado (${code}), reconectando en 5s...`);
+        setTimeout(() => crearSocket(empresaId, false), 5000);
       }
     }
   });
 
-  // ── Recibir mensajes ──────────────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
-
     for (const msg of messages) {
-      // ❌ Ignorar mensajes propios (enviados por el bot)
-      if (msg.key.fromMe) continue;
-      if (!msg.message)   continue;
-
-      // ❌ Ignorar mensajes de sistema, grupos y broadcasts
+      if (msg.key.fromMe || !msg.message) continue;
       const from = msg.key.remoteJid;
-      if (!from) continue;
-      if (from.endsWith('@g.us'))           continue; // grupos
-      if (from === 'status@broadcast')      continue; // estados
-      if (from.endsWith('@broadcast'))      continue; // broadcasts
-
-      // ❌ Ignorar mensajes muy antiguos (mas de 60 segundos absolutos)
+      if (!from || from.endsWith('@g.us') || from.includes('broadcast')) continue;
       const msgTimestamp = msg.messageTimestamp;
-      if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) {
-        console.log(`[${empresaId}] Mensaje antiguo ignorado`);
-        continue;
-      }
-
-      // ❌ Ignorar mensajes anteriores a la conexion de esta sesion
-      if (sesionData.connectedAt && msgTimestamp * 1000 < sesionData.connectedAt) {
-        console.log(`[${empresaId}] Mensaje previo a la conexion ignorado`);
-        continue;
-      }
-
-      // ❌ Evitar procesar el mismo mensaje dos veces
+      if (msgTimestamp && Date.now() / 1000 - msgTimestamp > 60) continue;
+      if (sesionData.connectedAt && msgTimestamp * 1000 < sesionData.connectedAt) continue;
       const msgId = msg.key.id;
-      if (!msgId) continue;
-      if (msgCache.get(msgId)) {
-        console.log(`[${empresaId}] Mensaje duplicado ignorado: ${msgId}`);
-        continue;
-      }
+      if (!msgId || msgCache.get(msgId)) continue;
       msgCache.set(msgId, true);
-
-      // Extraer texto
       const texto =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
-        msg.message?.buttonsResponseMessage?.selectedButtonId ||
-        msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-        msg.message?.imageMessage?.caption ||
-        '';
-
-      if (!texto || texto.trim().length === 0) continue;
-
+        msg.message?.imageMessage?.caption || '';
+      if (!texto.trim()) continue;
       const numeroCliente = from.replace('@s.whatsapp.net', '');
-      console.log(`[${empresaId}] Mensaje de ${numeroCliente}: ${texto.substring(0, 60)}`);
+      console.log(`[${empresaId}] MSG de ${numeroCliente}: ${texto.substring(0, 80)}`);
 
-      // Enviar a la API de agencIAme
       try {
         const resp = await axios.post(
           `${AGENCIAME_API}/api/whatsapp-baileys`,
@@ -284,184 +203,393 @@ async function iniciarSesion(empresaId, opts = {}) {
         );
 
         const respuesta = resp.data?.respuesta;
-        if (respuesta && respuesta.trim().length > 0) {
+        const imagenes  = resp.data?.imagenes || []; // [{url, caption}]
+
+        // 1. Enviar texto primero
+        if (respuesta?.trim()) {
           await sock.sendMessage(from, { text: respuesta });
-          console.log(`[${empresaId}] Respuesta enviada a ${numeroCliente}`);
         }
+
+        // 2. Enviar imagenes una por una con pausa entre ellas
+        if (imagenes.length > 0) {
+          console.log(`[${empresaId}] Enviando ${imagenes.length} imagenes a ${numeroCliente}`);
+          for (const img of imagenes) {
+            if (!img?.url) continue;
+            await enviarImagen(sock, from, img.url, img.caption || '');
+            // Pausa de 500ms entre imagenes para no saturar
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+
       } catch (err) {
-        // ── Log mejorado: muestra status, data y message del error ──
-        const status   = err.response?.status ?? 'N/A';
-        const errData  = err.response?.data   ?? null;
-        const errMsg   = err.message;
-        console.error(`[${empresaId}] ❌ Error llamando API (status ${status}):`, errMsg);
-        if (errData) console.error(`[${empresaId}] ❌ Response data:`, JSON.stringify(errData, null, 2));
-        // Solo enviar fallback si NO es un error de la IA (para no spamear)
-        if (err.code !== 'ECONNABORTED' && err.response?.status !== 500) {
-          await sock.sendMessage(from, {
-            text: 'En este momento no puedo procesar tu mensaje. Por favor intenta en unos minutos.',
-          });
-        }
+        if (err.response) console.error(`[${empresaId}] Error API ${err.response.status}:`, JSON.stringify(err.response.data));
+        else console.error(`[${empresaId}] Error red: ${err.message}`);
       }
     }
   });
 
+  return sesionData;
+}
+
+async function iniciarSesion(empresaId) {
+  const existente = sesiones.get(empresaId);
+  if (existente && existente.status === 'connected') return { status: 'already_connected' };
+  await crearSocket(empresaId, false);
   return { status: 'starting' };
 }
 
-// ── Restaurar sesiones activas al iniciar el servidor ────────────────────
 async function restaurarSesiones() {
-  const sessionDir = path.join(__dirname, 'sessions');
-  if (!fs.existsSync(sessionDir)) return;
+  try {
+    const snap = await db.collection('wa_sessions').get();
+    console.log(`Restaurando ${snap.size} sesiones desde Firestore...`);
+    for (const docSnap of snap.docs) {
+      try {
+        await iniciarSesion(docSnap.id);
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (e) { console.error(`Error restaurando ${docSnap.id}:`, e.message); }
+    }
+  } catch (e) { console.error('restaurarSesiones:', e.message); }
+}
 
-  const empresas = fs.readdirSync(sessionDir);
-  console.log(`Restaurando ${empresas.length} sesiones...`);
+// ══════════════════════════════════════════════════════════════
+//  RECORDATORIOS DE CITAS (Plan Pro) + SEGUIMIENTO POST-SERVICIO
+//  (Plan Estandar y Pro) — con limites de seguridad anti-bloqueo
+// ══════════════════════════════════════════════════════════════
 
-  for (const empresaId of empresas) {
+const ZONA_COL          = 'America/Bogota';
+const HORA_INICIO       = 8;   // 8am
+const HORA_FIN          = 20;  // 8pm
+const TOPE_DIARIO_AUTO  = 60;  // max mensajes automaticos por empresa por dia
+const DELAY_MIN_MS      = 4000;
+const DELAY_MAX_MS      = 12000;
+
+function horaColombia() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: ZONA_COL }));
+}
+
+function dentroHorarioPermitido() {
+  const h = horaColombia().getHours();
+  return h >= HORA_INICIO && h < HORA_FIN;
+}
+
+function fechaColombiaKey() {
+  const d = horaColombia();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+// Devuelve true si la empresa todavia tiene cupo hoy, e incrementa el contador
+async function puedeEnviarHoy(empresaId, max = TOPE_DIARIO_AUTO) {
+  try {
+    const fecha = fechaColombiaKey();
+    const ref   = db.collection('empresas').doc(empresaId).collection('contadores').doc(fecha);
+    const snap  = await ref.get();
+    const actual = snap.exists ? (snap.data().enviosAutomaticos || 0) : 0;
+    if (actual >= max) return false;
+    await ref.set({ enviosAutomaticos: FieldValue.increment(1), fecha, actualizadoEn: FieldValue.serverTimestamp() }, { merge: true });
+    return true;
+  } catch (e) {
+    console.error(`[${empresaId}] puedeEnviarHoy:`, e.message);
+    return false; // ante la duda, no enviar
+  }
+}
+
+function delayAleatorio(min = DELAY_MIN_MS, max = DELAY_MAX_MS) {
+  return new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
+}
+
+function toDateFlexible(v) {
+  if (!v) return null;
+  if (typeof v.toDate === 'function') return v.toDate();
+  if (v._seconds) return new Date(v._seconds * 1000);
+  if (v instanceof Date) return v;
+  return null;
+}
+
+// Envia un mensaje automatico respetando horario + tope diario.
+// Devuelve 'ok' | 'fuera_horario' | 'tope_alcanzado' | 'no_conectado' | 'error'
+async function enviarMensajeAutomatico(empresaId, numero, texto) {
+  const sesion = sesiones.get(empresaId);
+  if (!sesion || sesion.status !== 'connected') return 'no_conectado';
+  if (!dentroHorarioPermitido()) return 'fuera_horario';
+  if (!(await puedeEnviarHoy(empresaId))) return 'tope_alcanzado';
+  try {
+    const jid = numero.includes('@') ? numero : `${numero}@s.whatsapp.net`;
+    await sesion.sock.sendMessage(jid, { text: texto });
+    return 'ok';
+  } catch (e) {
+    console.error(`[${empresaId}] enviarMensajeAutomatico:`, e.message);
+    return 'error';
+  }
+}
+
+// ── Recordatorios de citas — 24h antes (Plan Pro) ─────────────
+async function revisarRecordatorios() {
+  if (!dentroHorarioPermitido()) return;
+
+  for (const [empresaId, sesion] of sesiones) {
+    if (sesion.status !== 'connected') continue;
+
     try {
-      await iniciarSesion(empresaId);
-      await new Promise(r => setTimeout(r, 1000)); // esperar 1s entre conexiones
-    } catch (err) {
-      console.error(`Error restaurando sesion ${empresaId}:`, err.message);
+      const empSnap = await db.collection('empresas').doc(empresaId).get();
+      const emp = empSnap.data();
+      if (!emp || emp.planActivo !== true) continue;
+
+      const plan = emp.planWasapbot || emp.plan;
+      if (plan !== 'pro') continue; // recordatorios: solo Plan Pro
+
+      const ahora  = Date.now();
+      const desde  = ahora + 23 * 3600000; // entre 23h
+      const hasta  = ahora + 25 * 3600000; // y 25h desde ahora
+
+      const citasSnap = await db.collection('empresas').doc(empresaId)
+        .collection('citas')
+        .where('recordatorioEnviado', '==', false)
+        .limit(50)
+        .get();
+
+      for (const doc of citasSnap.docs) {
+        const cita = doc.data();
+        if (!['pendiente', 'confirmada'].includes(cita.estado)) continue;
+        if (!cita.telefono) continue;
+
+        const fh = toDateFlexible(cita.fechaHora);
+        if (!fh) continue;
+        const t = fh.getTime();
+        if (t < desde || t > hasta) continue;
+
+        const nombre = cita.nombreCliente || 'cliente';
+        const texto =
+          `👋 Hola ${nombre}, te recordamos tu cita en *${emp.nombreEmpresa}*:\n\n` +
+          `📋 ${cita.servicio || 'Servicio'}\n` +
+          `📅 ${cita.fecha || ''} a las ${cita.hora || ''}\n\n` +
+          `Si necesitas reprogramar o cancelar, respóndenos por este chat. ¡Te esperamos! 😊`;
+
+        const resultado = await enviarMensajeAutomatico(empresaId, cita.telefono, texto);
+
+        if (resultado === 'ok') {
+          await doc.ref.update({ recordatorioEnviado: true, recordatorioEnviadoEn: FieldValue.serverTimestamp() });
+          console.log(`[${empresaId}] Recordatorio enviado -> ${cita.telefono}`);
+          await delayAleatorio();
+        } else if (resultado === 'tope_alcanzado' || resultado === 'fuera_horario') {
+          // No seguir intentando con esta empresa en esta ronda
+          break;
+        }
+        // 'no_conectado' / 'error' -> simplemente continua con la siguiente cita
+      }
+    } catch (e) {
+      console.error(`[${empresaId}] revisarRecordatorios:`, e.message);
     }
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// RUTAS API
-// ═══════════════════════════════════════════════════════════════════════
+// ── Seguimiento post-servicio — 2 a 5h despues (Plan Estandar y Pro) ──
+async function revisarSeguimientos() {
+  if (!dentroHorarioPermitido()) return;
 
-// GET /health — estado del servidor
+  for (const [empresaId, sesion] of sesiones) {
+    if (sesion.status !== 'connected') continue;
+
+    try {
+      const empSnap = await db.collection('empresas').doc(empresaId).get();
+      const emp = empSnap.data();
+      if (!emp || emp.planActivo !== true) continue;
+
+      const plan = emp.planWasapbot || emp.plan;
+      if (!['estandar', 'pro'].includes(plan)) continue; // seguimiento: Estandar y Pro
+
+      const ahora = Date.now();
+      const desde = ahora - 5 * 3600000; // completada hace 5h
+      const hasta = ahora - 2 * 3600000; // hasta hace 2h
+
+      const citasSnap = await db.collection('empresas').doc(empresaId)
+        .collection('citas')
+        .where('seguimientoEnviado', '==', false)
+        .limit(50)
+        .get();
+
+      for (const doc of citasSnap.docs) {
+        const cita = doc.data();
+        if (cita.estado !== 'completada') continue;
+        if (!cita.telefono) continue;
+
+        const ce = toDateFlexible(cita.completadoEn);
+        if (!ce) continue;
+        const t = ce.getTime();
+        if (t < desde || t > hasta) continue;
+
+        const nombre = cita.nombreCliente || 'cliente';
+        const texto =
+          `Hola ${nombre} 👋 Gracias por visitarnos en *${emp.nombreEmpresa}*.\n\n` +
+          `¿Cómo te fue con ${cita.servicio || 'tu servicio'}? Nos encantaría saber tu opinión — ` +
+          `y si necesitas algo más, aquí estamos para ayudarte 🙏`;
+
+        const resultado = await enviarMensajeAutomatico(empresaId, cita.telefono, texto);
+
+        if (resultado === 'ok') {
+          await doc.ref.update({ seguimientoEnviado: true, seguimientoEnviadoEn: FieldValue.serverTimestamp() });
+          console.log(`[${empresaId}] Seguimiento enviado -> ${cita.telefono}`);
+          await delayAleatorio();
+        } else if (resultado === 'tope_alcanzado' || resultado === 'fuera_horario') {
+          break;
+        }
+      }
+    } catch (e) {
+      console.error(`[${empresaId}] revisarSeguimientos:`, e.message);
+    }
+  }
+}
+
+async function correrTareasAutomaticas() {
+  await revisarRecordatorios().catch(e => console.error('revisarRecordatorios:', e.message));
+  await revisarSeguimientos().catch(e => console.error('revisarSeguimientos:', e.message));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  RUTAS
+// ══════════════════════════════════════════════════════════════
+
 app.get('/health', (req, res) => {
   const activas = [...sesiones.values()].filter(s => s.status === 'connected').length;
-  res.json({
-    ok: true,
-    sesionesActivas: activas,
-    sesionesTotales: sesiones.size,
-    uptime: process.uptime(),
-  });
+  res.json({ ok: true, sesionesActivas: activas, sesionesTotales: sesiones.size, uptime: process.uptime(), apiUrl: AGENCIAME_API });
 });
 
-// POST /sesion/iniciar — iniciar sesion para una empresa (genera QR)
-app.post('/sesion/iniciar', auth, async (req, res) => {
+app.post('/sesion/iniciar', authMiddleware, async (req, res) => {
   const { empresaId } = req.body;
   if (!empresaId) return res.status(400).json({ error: 'empresaId requerido' });
-
-  try {
-    const result = await iniciarSesion(empresaId);
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    console.error('Error iniciando sesion:', err.message, err.stack);
-    res.status(500).json({ error: err.message, stack: err.stack?.split('\n')[0] });
-  }
+  try { res.json({ ok: true, ...await iniciarSesion(empresaId) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /sesion/:empresaId/qr — obtener QR actual como imagen base64
-app.get('/sesion/:empresaId/qr', auth, async (req, res) => {
+app.get('/sesion/:empresaId/qr', authMiddleware, async (req, res) => {
   const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
-
-  if (!sesion) {
-    return res.json({ status: 'not_started' });
-  }
-
-  if (sesion.status === 'connected') {
-    return res.json({ status: 'connected', numero: sesion.numero });
-  }
-
-  if (sesion.status === 'qr_ready' && sesion.qrBase64) {
-    return res.json({ status: 'qr_ready', qrBase64: sesion.qrBase64 });
-  }
-
-  // Todavia generando QR — responder inmediatamente sin esperar
-  return res.json({ status: sesion.status || 'connecting' });
-});
-
-// POST /sesion/:empresaId/iniciar-pairing — iniciar sesion con codigo de vinculacion (sin QR, ideal para movil)
-app.post('/sesion/:empresaId/iniciar-pairing', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const { numero } = req.body;
-  if (!numero) return res.status(400).json({ error: 'numero requerido' });
-
-  try {
-    const result = await iniciarSesion(empresaId, { numero });
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    console.error('Error iniciando pairing:', err.message, err.stack);
-    res.status(500).json({ error: err.message, stack: err.stack?.split('\n')[0] });
-  }
-});
-
-// GET /sesion/:empresaId/pairing-code — obtener el codigo de vinculacion generado
-app.get('/sesion/:empresaId/pairing-code', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const sesion = sesiones.get(empresaId);
-
-  if (!sesion) return res.json({ status: 'not_started' });
+  if (!sesion) return res.status(404).json({ error: 'Sesion no encontrada' });
   if (sesion.status === 'connected') return res.json({ status: 'connected', numero: sesion.numero });
-  if (sesion.pairingCode) return res.json({ status: 'pairing_ready', pairingCode: sesion.pairingCode });
-
-  return res.json({ status: sesion.status || 'connecting' });
-});
-
-// GET /sesion/:empresaId/status — estado de la sesion
-app.get('/sesion/:empresaId/status', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const sesion = sesiones.get(empresaId);
-
-  if (!sesion) return res.json({ status: 'not_started', empresaId });
-
-  res.json({
-    status:  sesion.status,
-    numero:  sesion.numero,
-    empresaId,
-  });
-});
-
-// POST /sesion/:empresaId/desconectar — desconectar empresa
-app.post('/sesion/:empresaId/desconectar', auth, async (req, res) => {
-  const { empresaId } = req.params;
-  const sesion = sesiones.get(empresaId);
-
-  if (sesion?.sock) {
-    try {
-      await sesion.sock.logout();
-    } catch {}
+  if (sesion.qrBase64) return res.json({ status: 'qr_ready', qrBase64: sesion.qrBase64 });
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    const s = sesiones.get(empresaId);
+    if (s?.qrBase64) return res.json({ status: 'qr_ready', qrBase64: s.qrBase64 });
+    if (s?.status === 'connected') return res.json({ status: 'connected', numero: s.numero });
   }
+  res.status(408).json({ error: 'Timeout esperando QR' });
+});
 
-  fs.rmSync(path.join(__dirname, 'sessions', empresaId), { recursive: true, force: true });
+app.get('/sesion/:empresaId/status', authMiddleware, (req, res) => {
+  const s = sesiones.get(req.params.empresaId);
+  res.json(s ? { status: s.status, numero: s.numero } : { status: 'not_started' });
+});
+
+app.post('/sesion/:empresaId/iniciar-pairing', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
+  try {
+    const existente = sesiones.get(empresaId);
+    if (existente?.sock) try { existente.sock.end(); } catch {}
+    sesiones.delete(empresaId);
+    await crearSocket(empresaId, true);
+    await new Promise(r => setTimeout(r, 3000));
+    res.json({ ok: true, status: 'ready_for_pairing' });
+  } catch (e) {
+    console.error(`[${empresaId}] iniciar-pairing error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/sesion/:empresaId/pairing-code', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
+  const { telefono }  = req.body;
+  if (!telefono) return res.status(400).json({ error: 'telefono requerido' });
+  const sesion = sesiones.get(empresaId);
+  if (!sesion?.sock) return res.status(400).json({ error: 'Primero llama a /iniciar-pairing' });
+  if (sesion.status === 'connected') return res.json({ ok: true, status: 'already_connected', numero: sesion.numero });
+  try {
+    const tel = telefono.replace(/\D/g, '');
+    console.log(`[${empresaId}] Solicitando pairing code para ${tel}...`);
+    const code = await sesion.sock.requestPairingCode(tel);
+    const rawCode = String(code || '');
+    console.log(`[${empresaId}] Pairing code: "${rawCode}" (${rawCode.length} chars)`);
+    res.json({ ok: true, code: rawCode, raw: rawCode });
+  } catch (e) {
+    console.error(`[${empresaId}] requestPairingCode error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/sesion/:empresaId/desconectar', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
+  const sesion = sesiones.get(empresaId);
+  if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+  await deleteSessionFromFirestore(empresaId);
   sesiones.delete(empresaId);
-
-  await db.collection('empresas').doc(empresaId).update({
-    'whatsapp.status': 'disconnected',
-    'whatsapp.numero': null,
-  }).catch(() => {});
-
-  res.json({ ok: true, mensaje: 'Sesion desconectada' });
+  await db.collection('empresas').doc(empresaId).set(
+    { whatsapp: { status: 'disconnected', activo: false, numero: null } }, { merge: true }
+  ).catch(() => {});
+  res.json({ ok: true });
 });
 
-// POST /enviar — enviar mensaje desde la plataforma (para notificaciones)
-app.post('/enviar', auth, async (req, res) => {
-  const { empresaId, numero, texto } = req.body;
-  if (!empresaId || !numero || !texto) {
-    return res.status(400).json({ error: 'empresaId, numero y texto requeridos' });
-  }
+app.get('/sesiones', authMiddleware, async (req, res) => {
+  const enMemoria = [...sesiones.entries()].map(([id, s]) => ({ empresaId: id, status: s.status, numero: s.numero }));
+  const snap = await db.collection('wa_sessions').get();
+  res.json({ enMemoria, enFirestore: snap.docs.map(d => d.id) });
+});
 
+app.delete('/sesion/:empresaId', authMiddleware, async (req, res) => {
+  const { empresaId } = req.params;
   const sesion = sesiones.get(empresaId);
-  if (!sesion || sesion.status !== 'connected') {
-    return res.status(400).json({ error: 'Empresa no conectada a WhatsApp' });
-  }
+  if (sesion?.sock) try { await sesion.sock.logout(); } catch {}
+  const sessionDir = path.join('/tmp', 'wa_sessions', empresaId);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+  await deleteSessionFromFirestore(empresaId);
+  sesiones.delete(empresaId);
+  res.json({ ok: true });
+});
 
+app.delete('/sesiones/todas', authMiddleware, async (req, res) => {
+  const snap = await db.collection('wa_sessions').get();
+  for (const d of snap.docs) {
+    const s = sesiones.get(d.id);
+    if (s?.sock) try { await s.sock.logout(); } catch {}
+    sesiones.delete(d.id);
+    await d.ref.delete();
+  }
+  fs.rmSync(path.join('/tmp', 'wa_sessions'), { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+app.post('/enviar', authMiddleware, async (req, res) => {
+  const { empresaId, numero, texto } = req.body;
+  const sesion = sesiones.get(empresaId);
+  if (!sesion || sesion.status !== 'connected') return res.status(400).json({ error: 'No conectado' });
   try {
     const jid = numero.includes('@') ? numero : `${numero}@s.whatsapp.net`;
+    // Esperar 3s para que Baileys se estabilice después de conectar
+    await new Promise(r => setTimeout(r, 3000));
     await sesion.sock.sendMessage(jid, { text: texto });
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Iniciar servidor ──────────────────────────────────────────────────────
+// ── Endpoint manual para forzar la revision de recordatorios/seguimientos
+//    (util para pruebas — en produccion corre solo via setInterval) ──
+app.post('/admin/revisar-automaticos', authMiddleware, async (req, res) => {
+  try {
+    await correrTareasAutomaticas();
+    res.json({ ok: true, ejecutado: true, horaPermitida: dentroHorarioPermitido() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, async () => {
-  console.log(`agencIAme WhatsApp Server corriendo en puerto ${PORT}`);
+  console.log(`\nagencIAme WhatsApp Server v4 en puerto ${PORT}`);
+  console.log(`API Vercel: ${AGENCIAME_API}`);
+  console.log(`Secret: ${SERVER_SECRET ? 'OK' : 'FALTA'}`);
   await restaurarSesiones();
+
+  // Esperar 1 minuto a que las sesiones reconecten antes de la primera corrida
+  setTimeout(() => {
+    correrTareasAutomaticas();
+    // Cada 15 minutos
+    setInterval(correrTareasAutomaticas, 15 * 60 * 1000);
+  }, 60000);
 });
