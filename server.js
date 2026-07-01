@@ -64,11 +64,18 @@ async function getBaileys() {
 }
 
 // ── Crear/reconectar sesion para una empresa ──────────────────────────────
-async function iniciarSesion(empresaId) {
+async function iniciarSesion(empresaId, opts = {}) {
+  const { numero } = opts;
+
   // Si ya hay sesion activa, no hacer nada
   const existente = sesiones.get(empresaId);
   if (existente && existente.status === 'connected') {
     return { status: 'already_connected' };
+  }
+  // Si hay una sesion previa sin conectar (ej. QR) y ahora se pide pairing (o viceversa), reiniciamos el socket
+  if (existente && existente.sock) {
+    try { existente.sock.end?.(new Error('reinicio de sesion')); } catch {}
+    sesiones.delete(empresaId);
   }
 
   const {
@@ -104,14 +111,37 @@ async function iniciarSesion(empresaId) {
     qrBase64: null,
     empresaId,
     numero: null,
+    pairingCode: null,
+    metodo: numero ? 'pairing' : 'qr',
   };
   sesiones.set(empresaId, sesionData);
+
+  // ── Si se pidio codigo de vinculacion (pairing), solicitarlo ya mismo ────
+  if (numero && !state.creds.registered) {
+    try {
+      const numeroLimpio = String(numero).replace(/[^\d]/g, '');
+      const code = await sock.requestPairingCode(numeroLimpio);
+      sesionData.pairingCode = code;
+      sesionData.status = 'pairing_ready';
+
+      await db.collection('empresas').doc(empresaId).update({
+        'whatsapp.status': 'pairing_ready',
+        'whatsapp.pairingCode': code,
+        'whatsapp.updatedAt': FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      console.log(`[${empresaId}] Pairing code generado: ${code}`);
+    } catch (err) {
+      console.error(`[${empresaId}] Error generando pairing code:`, err.message);
+      sesionData.status = 'error';
+    }
+  }
 
   // ── Eventos Baileys ───────────────────────────────────────────────────
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
+    if (qr && sesionData.metodo !== 'pairing') {
       // Generar QR como imagen base64
       const qrBase64 = await qrcode.toDataURL(qr);
       sesionData.qr      = qr;
@@ -315,6 +345,33 @@ app.get('/sesion/:empresaId/qr', auth, async (req, res) => {
   }
 
   // Todavia generando QR — responder inmediatamente sin esperar
+  return res.json({ status: sesion.status || 'connecting' });
+});
+
+// POST /sesion/:empresaId/iniciar-pairing — iniciar sesion con codigo de vinculacion (sin QR, ideal para movil)
+app.post('/sesion/:empresaId/iniciar-pairing', auth, async (req, res) => {
+  const { empresaId } = req.params;
+  const { numero } = req.body;
+  if (!numero) return res.status(400).json({ error: 'numero requerido' });
+
+  try {
+    const result = await iniciarSesion(empresaId, { numero });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('Error iniciando pairing:', err.message, err.stack);
+    res.status(500).json({ error: err.message, stack: err.stack?.split('\n')[0] });
+  }
+});
+
+// GET /sesion/:empresaId/pairing-code — obtener el codigo de vinculacion generado
+app.get('/sesion/:empresaId/pairing-code', auth, async (req, res) => {
+  const { empresaId } = req.params;
+  const sesion = sesiones.get(empresaId);
+
+  if (!sesion) return res.json({ status: 'not_started' });
+  if (sesion.status === 'connected') return res.json({ status: 'connected', numero: sesion.numero });
+  if (sesion.pairingCode) return res.json({ status: 'pairing_ready', pairingCode: sesion.pairingCode });
+
   return res.json({ status: sesion.status || 'connecting' });
 });
 
