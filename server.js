@@ -94,8 +94,19 @@ async function iniciarSesion(empresaId, opts = {}) {
   const sessionDir = path.join(__dirname, 'sessions', empresaId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const { version }          = await fetchLatestBaileysVersion();
+  let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+  // Si se pide codigo de vinculacion y esta empresa no tiene una sesion ya
+  // vinculada, empezamos con credenciales 100% limpias. Reusar el noise-key
+  // que quedo de un intento de QR anterior sobre la misma carpeta hace que
+  // WhatsApp cierre la conexion ("Connection Closed") al pedir el pairing code.
+  if (numero && !state.creds.registered) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
+  }
+
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
