@@ -37,7 +37,7 @@ const db = getFirestore();
 // ── Config ────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3001;
 const SERVER_SECRET = process.env.SERVER_SECRET || 'agenciame2026secret';
-const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://nexoia-soporteias-projects.vercel.app';
+const AGENCIAME_API = process.env.AGENCIAME_API_URL || 'https://bqinzagencia.com';
 
 // ── Sesiones en memoria ───────────────────────────────────────────────────
 // Map: empresaId -> { sock, status, qr, qrBase64, mensajesPendientes }
@@ -266,7 +266,12 @@ async function iniciarSesion(empresaId, opts = {}) {
           console.log(`[${empresaId}] Respuesta enviada a ${numeroCliente}`);
         }
       } catch (err) {
-        console.error(`[${empresaId}] Error:`, err.message);
+        // ── Log mejorado: muestra status, data y message del error ──
+        const status   = err.response?.status ?? 'N/A';
+        const errData  = err.response?.data   ?? null;
+        const errMsg   = err.message;
+        console.error(`[${empresaId}] ❌ Error llamando API (status ${status}):`, errMsg);
+        if (errData) console.error(`[${empresaId}] ❌ Response data:`, JSON.stringify(errData, null, 2));
         // Solo enviar fallback si NO es un error de la IA (para no spamear)
         if (err.code !== 'ECONNABORTED' && err.response?.status !== 500) {
           await sock.sendMessage(from, {
